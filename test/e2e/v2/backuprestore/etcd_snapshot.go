@@ -3,40 +3,33 @@
 package backuprestore
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"strings"
+	"time"
 
-	"github.com/go-logr/logr"
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/test/e2e/v2/internal"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	// EtcdPodName is the name of the etcd pod whose init container logs are verified.
-	EtcdPodName = "etcd-0"
-	// EtcdInitContainerName is the name of the init container in the etcd pod.
-	EtcdInitContainerName = "etcd-init"
-
 	// HCPEtcdBackupNamePrefix is the prefix used by the OADP plugin when creating
 	// HCPEtcdBackup resources. The full name follows the pattern: oadp-<BackupName>-<random>.
 	HCPEtcdBackupNamePrefix = "oadp-"
 
-	// logRestoringSnapshot is emitted by etcdutl/etcdctl when starting a snapshot restore.
-	logRestoringSnapshot = "restoring snapshot"
-	// logRestoredSnapshot is emitted by etcdutl/etcdctl when snapshot restore completes.
-	logRestoredSnapshot = "restored snapshot"
-	// logNotRestoringSnapshot indicates the restore was skipped because data already existed.
-	logNotRestoringSnapshot = "not empty, not restoring snapshot"
+	// RestoreMarkerNamespace is the hosted-cluster namespace where the restore marker
+	// ConfigMap is created. "default" always exists and its contents are captured by the
+	// etcd snapshot.
+	RestoreMarkerNamespace = "default"
+	// restoreMarkerDataKey is the ConfigMap data key holding the unique marker value.
+	restoreMarkerDataKey = "restoreMarker"
 )
 
 // MatchesHCPEtcdBackupName checks whether an HCPEtcdBackup resource name matches the
@@ -78,107 +71,57 @@ func WaitForHCPEtcdBackupCondition(testCtx *internal.TestContext, backupName str
 	})
 }
 
-// VerifyEtcdInitLogs retrieves the etcd-init container logs from the etcd-0 pod in the
-// control plane namespace and verifies that they contain expected snapshot restore traces.
-// The expected log lines from etcdutl/etcdctl indicate a successful snapshot restore:
-//   - "restoring snapshot" (restore started)
-//   - "restored snapshot" (restore completed)
+// RestoreMarkerName returns the name of the restore marker ConfigMap for a cluster.
+func RestoreMarkerName(clusterName string) string {
+	return fmt.Sprintf("etcd-restore-marker-%s", clusterName)
+}
+
+// SeedRestoreMarker creates (or updates) a ConfigMap in the hosted cluster carrying a
+// unique value and returns that value. It must be called before the etcd snapshot backup
+// is taken so the marker is captured in the snapshot.
 //
-// It also checks that the restore was not skipped due to existing data:
-//   - "not empty, not restoring snapshot" must NOT be present
-func VerifyEtcdInitLogs(ctx context.Context, logger logr.Logger, kubeClient kubernetes.Interface, controlPlaneNamespace string) error {
-	podLogOpts := &corev1.PodLogOptions{
-		Container: EtcdInitContainerName,
+// After a break-and-restore cycle the entire control plane (including etcd) is destroyed
+// and rebuilt, so the marker can only reappear if the etcd snapshot was actually restored.
+// Verifying it post-restore therefore proves the restore was not skipped (e.g. via the
+// split-brain / "data directory not empty" path). ConfigMap writes are synchronous to
+// etcd, so the marker is durable once this returns.
+func SeedRestoreMarker(ctx context.Context, hostedClusterClient crclient.Client, clusterName string) (string, error) {
+	value := fmt.Sprintf("restore-marker-%d", time.Now().UnixNano())
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      RestoreMarkerName(clusterName),
+			Namespace: RestoreMarkerNamespace,
+		},
+		Data: map[string]string{restoreMarkerDataKey: value},
 	}
-
-	req := kubeClient.CoreV1().Pods(controlPlaneNamespace).GetLogs(EtcdPodName, podLogOpts)
-	logStream, err := req.Stream(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to stream %s container logs from %s: %w", EtcdInitContainerName, EtcdPodName, err)
-	}
-	defer logStream.Close()
-
-	result, err := parseEtcdInitLogs(logStream)
-	if err != nil {
-		return err
-	}
-
-	logger.Info("etcd-init container logs scanned", "lines", result.lineCount)
-
-	if result.restoreSkipped {
-		for _, line := range result.tailLines {
-			logger.V(1).Info("etcd-init tail", "log", line)
+	if err := hostedClusterClient.Create(ctx, cm); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("failed to create restore marker ConfigMap %s/%s: %w", RestoreMarkerNamespace, cm.Name, err)
 		}
-		return fmt.Errorf("etcd-init logs contain '%s'; restore was skipped because data directory was not empty", logNotRestoringSnapshot)
-	}
-	if !result.restoreStarted {
-		for _, line := range result.tailLines {
-			logger.V(1).Info("etcd-init tail", "log", line)
+		existing := &corev1.ConfigMap{}
+		if err := hostedClusterClient.Get(ctx, crclient.ObjectKeyFromObject(cm), existing); err != nil {
+			return "", fmt.Errorf("failed to get existing restore marker ConfigMap %s/%s: %w", RestoreMarkerNamespace, cm.Name, err)
 		}
-		return fmt.Errorf("etcd-init logs do not contain '%s'; snapshot restore may not have started", logRestoringSnapshot)
-	}
-	if !result.restoreCompleted {
-		for _, line := range result.tailLines {
-			logger.V(1).Info("etcd-init tail", "log", line)
+		existing.Data = cm.Data
+		if err := hostedClusterClient.Update(ctx, existing); err != nil {
+			return "", fmt.Errorf("failed to update restore marker ConfigMap %s/%s: %w", RestoreMarkerNamespace, cm.Name, err)
 		}
-		return fmt.Errorf("etcd-init logs do not contain '%s'; snapshot restore may have failed", logRestoredSnapshot)
 	}
+	return value, nil
+}
 
+// VerifyRestoreMarker fetches the restore marker ConfigMap from the (restored) hosted
+// cluster and verifies its value matches expectedValue. A missing marker or a mismatched
+// value indicates the etcd snapshot was not restored (the datastore is fresh/empty),
+// which is the failure mode this check is designed to catch.
+func VerifyRestoreMarker(ctx context.Context, hostedClusterClient crclient.Client, clusterName, expectedValue string) error {
+	cm := &corev1.ConfigMap{}
+	key := crclient.ObjectKey{Namespace: RestoreMarkerNamespace, Name: RestoreMarkerName(clusterName)}
+	if err := hostedClusterClient.Get(ctx, key, cm); err != nil {
+		return fmt.Errorf("failed to get restore marker ConfigMap %s/%s: %w", key.Namespace, key.Name, err)
+	}
+	if got := cm.Data[restoreMarkerDataKey]; got != expectedValue {
+		return fmt.Errorf("restore marker value mismatch for %s/%s: expected %q, got %q; etcd snapshot may not have been restored", key.Namespace, key.Name, expectedValue, got)
+	}
 	return nil
-}
-
-// etcdInitLogResult holds the results of parsing etcd-init container logs.
-type etcdInitLogResult struct {
-	restoreStarted   bool
-	restoreCompleted bool
-	restoreSkipped   bool
-	lineCount        int
-	tailLines        []string
-}
-
-// parseEtcdInitLogs scans etcd-init container log output and checks for expected
-// snapshot restore trace messages from etcdutl/etcdctl.
-func parseEtcdInitLogs(reader io.Reader) (*etcdInitLogResult, error) {
-	const tailSize = 50
-
-	result := &etcdInitLogResult{}
-
-	// Use a ring buffer so old strings become eligible for GC immediately
-	// instead of being retained by the underlying slice array.
-	ring := make([]string, tailSize)
-	ringIdx := 0
-	ringLen := 0
-
-	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, 256*1024)
-	scanner.Buffer(buf, 512*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		result.lineCount++
-		ring[ringIdx] = line
-		ringIdx = (ringIdx + 1) % tailSize
-		if ringLen < tailSize {
-			ringLen++
-		}
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, logNotRestoringSnapshot) {
-			result.restoreSkipped = true
-		} else if strings.Contains(lower, logRestoredSnapshot) {
-			result.restoreCompleted = true
-		} else if strings.Contains(lower, logRestoringSnapshot) {
-			result.restoreStarted = true
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading etcd-init logs: %w", err)
-	}
-
-	// Flatten the ring buffer into chronological order.
-	result.tailLines = make([]string, ringLen)
-	start := (ringIdx - ringLen + tailSize) % tailSize
-	for i := range ringLen {
-		result.tailLines[i] = ring[(start+i)%tailSize]
-	}
-
-	return result, nil
 }

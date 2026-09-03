@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -389,6 +388,7 @@ var _ = Describe("[sig-hypershift][Jira:Hypershift][Feature:EtcdSnapshot] Backup
 		testCtx            *internal.TestContext
 		backupName         string
 		snapshotURL        string
+		restoreMarkerValue string
 		expectedConditions []util.Condition
 	)
 
@@ -487,6 +487,18 @@ var _ = Describe("[sig-hypershift][Jira:Hypershift][Feature:EtcdSnapshot] Backup
 	Context(ContextPreBackupControlPlane, func() {
 		It("should have control plane healthy before backup", func() {
 			expectedConditions = validatePreBackupControlPlane(testCtx, platformCfg.excludeWorkloads)
+		})
+
+		It("should seed a restore marker in the hosted cluster", func() {
+			By("Creating a marker ConfigMap in the hosted cluster to verify restore fidelity")
+			hc, err := testCtx.GetHostedCluster()
+			Expect(err).NotTo(HaveOccurred())
+			hcClient, err := testCtx.GetHostedClusterClient(hc)
+			Expect(err).NotTo(HaveOccurred())
+			restoreMarkerValue, err = backuprestore.SeedRestoreMarker(testCtx.Context, hcClient, testCtx.ClusterName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(restoreMarkerValue).NotTo(BeEmpty())
+			GinkgoWriter.Printf("Seeded restore marker %s in hosted cluster\n", backuprestore.RestoreMarkerName(testCtx.ClusterName))
 		})
 	})
 
@@ -607,15 +619,22 @@ var _ = Describe("[sig-hypershift][Jira:Hypershift][Feature:EtcdSnapshot] Backup
 			GinkgoWriter.Printf("RestoreSnapshotURL is set on HostedCluster\n")
 		})
 
-		It("should have etcd-init container logs showing successful snapshot restore", func() {
-			By("Verifying etcd-0 init container logs for snapshot restore traces")
-			restConfig, err := util.GetConfig()
-			Expect(err).NotTo(HaveOccurred(), "failed to get REST config for pod log access")
-			kubeClient, err := kubernetes.NewForConfig(restConfig)
-			Expect(err).NotTo(HaveOccurred(), "failed to create kubernetes clientset")
-
-			err = backuprestore.VerifyEtcdInitLogs(testCtx.Context, GinkgoLogr.WithName("etcd-init"), kubeClient, testCtx.ControlPlaneNamespace)
-			Expect(err).NotTo(HaveOccurred(), "etcd-init container logs should confirm snapshot restore")
+		It("should have the restore marker present in the hosted cluster after restore", func() {
+			if restoreMarkerValue == "" {
+				Skip("restore marker was not seeded; the seed spec may have failed")
+			}
+			By("Verifying the restore marker ConfigMap is present with the expected value")
+			// The marker can only reappear if the etcd snapshot was actually restored:
+			// the break step destroys the entire control plane (including etcd), so a
+			// fresh/empty datastore (e.g. a skipped restore) would not contain it.
+			Eventually(func(g Gomega) {
+				hc, err := testCtx.GetHostedCluster()
+				g.Expect(err).NotTo(HaveOccurred())
+				hcClient, err := testCtx.GetHostedClusterClient(hc)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(backuprestore.VerifyRestoreMarker(testCtx.Context, hcClient, testCtx.ClusterName, restoreMarkerValue)).To(Succeed())
+			}).WithPolling(backuprestore.PollInterval).WithTimeout(backuprestore.RestoreTimeout).Should(Succeed())
+			GinkgoWriter.Printf("Restore marker verified in hosted cluster after restore\n")
 		})
 	})
 })
